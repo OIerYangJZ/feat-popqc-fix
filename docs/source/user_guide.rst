@@ -222,6 +222,25 @@ Instead of relying on the provided default set of BQSKit passes, you can specify
 
 The ``BQSKitTransformationPass`` is just one example of the extensibility of UCC. If you would like to port a compile pass from another framework, please create a `proposal <https://github.com/unitaryfoundation/ucc/discussions/new?category=new-compiler-pass>`_ and be ready to benchmark its performance relative to ``UCCDefault1``.
 
+An Example of a Custom Pass: PopQCTransformationPass
+====================================================
+
+The ``PopQCTransformationPass`` is a structure-aware pass provided in ``ucc.transpilers.ucc_popqc``. It is designed to cheaply simplify circuits with repeated exact blocks, adjacent inverse blocks, and commuting inverse chains before heavier synthesis runs.
+
+PopQC is most useful on structured circuits that contain repeated ``U`` / ``U†`` patterns. It is not expected to improve every circuit class, but it can avoid severe gate-count expansion on workloads with large repeated cancellation opportunities.
+
+Here is an example of how to use the ``PopQCTransformationPass``:
+
+.. code:: python
+
+   from ucc import compile
+   from ucc.transpilers.ucc_popqc import PopQCTransformationPass
+
+   result = compile(
+       circuit_to_compile,
+       custom_passes=[PopQCTransformationPass()],
+   )
+
 
 An example of a custom pass: Approximate Quantum Compilation via MPS encoding
 =============================================================================
