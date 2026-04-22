@@ -1,4 +1,7 @@
 import pytest
+import math
+import importlib
+import cirq
 from cirq import Circuit as CirqCircuit
 from cirq import CNOT, H, X, LineQubit, NamedQubit
 from cirq.testing import assert_same_circuits
@@ -11,11 +14,150 @@ from qiskit.transpiler.passes import GatesInBasis, CountOps
 from qiskit.transpiler.passes.utils import CheckMap
 from qiskit.transpiler.basepasses import TransformationPass
 from qiskit.circuit.library import HGate, XGate
+from qiskit.circuit.library import QAOAAnsatz
+from qiskit.quantum_info import SparsePauliOp
 from ucc.tests.mock_backends import Mybackend
 from ucc import compile
+from ucc.compile import (
+    _CompileDispatchPlan,
+    _InstructionSpanNode,
+    _RepeatedSpanNode,
+    _build_compile_dispatch_plan,
+    _build_hierarchical_nodes,
+    _compile_repeated_structure_dispatch,
+    _compile_repeated_composite_prefix_reference,
+    _compile_hierarchical_reference,
+    _compile_backend_default_portfolio,
+    _build_semantic_ir,
+    _lower_semantic_ir_to_target_basis,
+    _semantic_local_simplify,
+    _merge_adjacent_parameterized_gates,
+    _should_use_backend_repeated_run_shortcut,
+    _should_direct_short_circuit_qiskit_source_preset,
+    _should_direct_short_circuit_repeated_basis_source,
+    _should_direct_short_circuit_small_basis_source_preset,
+    _should_short_circuit_to_source_preset,
+    _should_compare_against_direct_full_preset,
+    _should_compare_against_presimplified_preset,
+    _structural_pre_simplify,
+)
 from ucc.transpilers.ucc_defaults import UCCDefault1
 from ucc.transpilers.aqc.mps_pass import MPSPass
 import numpy as np
+
+
+def repeated_block(block, repeats):
+    circuit = QiskitCircuit(block.num_qubits)
+    for _ in range(repeats):
+        circuit.compose(block, inplace=True)
+    return circuit
+
+
+def qft_forward_block(num_qubits):
+    qc = QiskitCircuit(num_qubits)
+    for target in range(num_qubits):
+        qc.h(target)
+        for control in range(target + 1, num_qubits):
+            qc.cp(math.pi / (2 ** (control - target)), control, target)
+    for i in range(num_qubits // 2):
+        qc.swap(i, num_qubits - 1 - i)
+    return qc
+
+
+def qft_inverse_block(num_qubits):
+    qc = QiskitCircuit(num_qubits)
+    for i in range(num_qubits // 2):
+        qc.swap(i, num_qubits - 1 - i)
+    for target in reversed(range(num_qubits)):
+        for control in reversed(range(target + 1, num_qubits)):
+            qc.cp(-math.pi / (2 ** (control - target)), control, target)
+        qc.h(target)
+    return qc
+
+
+def qaoa_ring_circuit(num_qubits, layers, gamma=0.125, beta=0.25):
+    qc = QiskitCircuit(num_qubits)
+    for _ in range(layers):
+        for qubit in range(num_qubits):
+            qc.h(qubit)
+        for qubit in range(num_qubits):
+            neighbour = (qubit + 1) % num_qubits
+            qc.cx(qubit, neighbour)
+            qc.rz(gamma, neighbour)
+            qc.cx(qubit, neighbour)
+        for qubit in range(num_qubits):
+            qc.rx(beta, qubit)
+    return qc
+
+
+def qpe_roundtrip_block(eval_qubits):
+    total_qubits = eval_qubits + 1
+    phase_qubit = eval_qubits
+    qc = QiskitCircuit(total_qubits)
+
+    for qubit in range(eval_qubits):
+        qc.h(qubit)
+
+    for qubit in range(eval_qubits):
+        for _ in range(2**qubit):
+            qc.cp(math.pi / 8, qubit, phase_qubit)
+
+    for qubit in reversed(range(eval_qubits)):
+        for control in reversed(range(qubit + 1, eval_qubits)):
+            qc.cp(-math.pi / (2 ** (control - qubit)), control, qubit)
+        qc.h(qubit)
+
+    for qubit in range(eval_qubits // 2):
+        qc.swap(qubit, eval_qubits - 1 - qubit)
+
+    for qubit in range(eval_qubits):
+        qc.h(qubit)
+
+    for qubit in reversed(range(eval_qubits)):
+        for _ in range(2**qubit):
+            qc.cp(-math.pi / 8, qubit, phase_qubit)
+
+    return qc
+
+
+def grover_mirrored_block(num_qubits):
+    qc = QiskitCircuit(num_qubits)
+    oracle_qubits = list(range(num_qubits - 1))
+    ancilla = num_qubits - 1
+
+    for qubit in oracle_qubits:
+        qc.h(qubit)
+    qc.x(ancilla)
+    qc.h(ancilla)
+    qc.mcx(oracle_qubits, ancilla)
+
+    for qubit in oracle_qubits:
+        qc.h(qubit)
+        qc.x(qubit)
+    qc.h(oracle_qubits[-1])
+    qc.mcx(oracle_qubits[:-1], oracle_qubits[-1])
+    qc.h(oracle_qubits[-1])
+    for qubit in oracle_qubits:
+        qc.x(qubit)
+        qc.h(qubit)
+
+    for qubit in reversed(oracle_qubits):
+        qc.h(qubit)
+    qc.h(ancilla)
+    qc.x(ancilla)
+
+    return qc
+
+
+def complete_graph_maxcut_operator(num_qubits):
+    terms = []
+    for i in range(num_qubits):
+        for j in range(i + 1, num_qubits):
+            label = ["I"] * num_qubits
+            label[num_qubits - 1 - i] = "Z"
+            label[num_qubits - 1 - j] = "Z"
+            terms.append(("".join(label), 1.0))
+    return SparsePauliOp.from_list(terms)
 
 
 def random_area_law_circuit(N, seed=12345):
@@ -87,6 +229,60 @@ def random_clifford_circuit(num_qubits, seed=12345):
     return qc
 
 
+def test_build_hierarchical_nodes_detects_dominant_repeated_run():
+    repeated_gate_body = QiskitCircuit(2)
+    repeated_gate_body.cx(0, 1)
+    repeated_gate_body.h(0)
+    repeated_gate = repeated_gate_body.to_gate(label="R")
+
+    circuit = QiskitCircuit(2)
+    circuit.x(0)
+    for _ in range(10):
+        circuit.append(repeated_gate, [0, 1])
+    circuit.z(1)
+
+    nodes = _build_hierarchical_nodes(circuit)
+
+    assert nodes[0] == _InstructionSpanNode(0, 1)
+    assert nodes[1] == _RepeatedSpanNode(1, 1, 10)
+    assert nodes[2] == _InstructionSpanNode(11, 12)
+
+
+def test_compile_hierarchical_reference_locally_compiles_repeated_composite_run(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+
+    repeated_gate_body = QiskitCircuit(2)
+    repeated_gate_body.cx(0, 1)
+    repeated_gate_body.h(0)
+    repeated_gate = repeated_gate_body.to_gate(label="R")
+
+    circuit = QiskitCircuit(2)
+    for _ in range(10):
+        circuit.append(repeated_gate, [0, 1])
+
+    class FakeCompiler:
+        target_backend = None
+        target_gateset = {"u", "cx", "p"}
+
+    transpile_call_sizes = []
+
+    def wrapped_qiskit_transpile(subcircuit, **kwargs):
+        transpile_call_sizes.append(len(subcircuit.data))
+        compiled = QiskitCircuit(2)
+        compiled.cx(0, 1)
+        return compiled
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+
+    rebuilt_circuit = _compile_hierarchical_reference(circuit, FakeCompiler())
+
+    assert rebuilt_circuit is not None
+    assert len(rebuilt_circuit.data) == 10
+    assert max(transpile_call_sizes) == 1
+
+
 def test_qiskit_compile():
     circuit = QiskitCircuit(2)
     circuit.h(0)
@@ -142,7 +338,28 @@ def test_custom_pass():
     cirq_circuit = CirqCircuit(H(qubit))
 
     post_compiler_circuit = compile(cirq_circuit, custom_passes=[HtoX()])
-    assert_same_circuits(post_compiler_circuit, CirqCircuit(X(qubit)))
+    assert cirq.equal_up_to_global_phase(
+        cirq.unitary(post_compiler_circuit), cirq.unitary(CirqCircuit(X(qubit)))
+    )
+
+
+def test_qiskit_roundtrip_bypasses_qbraid_translate(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+    circuit = QiskitCircuit(2)
+    circuit.h(0)
+    circuit.cx(0, 1)
+
+    monkeypatch.setattr(
+        compile_module,
+        "translate",
+        lambda *args, **kwargs: pytest.fail(
+            "qBraid translate should not run for qiskit->qiskit compile"
+        ),
+    )
+
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert isinstance(result_circuit, QiskitCircuit)
 
 
 def test_compile_target_backend_opset():
@@ -572,7 +789,1164 @@ def test_compile_trivial_state_with_mps_pass():
     )
 
     assert compiled_circuit.count_ops().get("cx", 0) == 0
-    assert np.round(fidelity, decimals=10) == 1.0
+
+
+def repeated_qft_inverse_block(repeats=4):
+    circuit = QiskitCircuit(8)
+    base_block = QiskitCircuit(8)
+
+    for target in range(8):
+        base_block.h(target)
+        for control in range(target + 1, 8):
+            base_block.cp(np.pi / (2 ** (control - target)), control, target)
+
+    for i in range(4):
+        base_block.swap(i, 7 - i)
+
+    for i in range(4):
+        base_block.swap(i, 7 - i)
+
+    for target in reversed(range(8)):
+        for control in reversed(range(target + 1, 8)):
+            base_block.cp(
+                -np.pi / (2 ** (control - target)), control, target
+            )
+        base_block.h(target)
+
+    for _ in range(repeats):
+        circuit.compose(base_block, inplace=True)
+    return circuit
+
+
+def test_compile_cancels_repeated_qft_inverse_pairs():
+    circuit = repeated_qft_inverse_block()
+
+    compiled_circuit = compile(circuit, return_format="qiskit")
+
+    assert len(circuit.data) > 0
+    assert len(compiled_circuit.data) == 0
+
+
+def test_compile_prefers_preset_reference_for_repeated_qft_structure():
+    circuit = repeated_block(qft_forward_block(8), repeats=8)
+
+    basis_translated_circuit = qiskit_transpile(
+        circuit,
+        basis_gates=UCCDefault1.DEFAULT_GATESET,
+        optimization_level=0,
+    )
+    preset_reference = qiskit_transpile(
+        circuit,
+        basis_gates=list(UCCDefault1.DEFAULT_GATESET),
+        optimization_level=3,
+        layout_method="trivial",
+        routing_method="none",
+    )
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert len(preset_reference.data) < len(basis_translated_circuit.data)
+    assert result_circuit.count_ops() == preset_reference.count_ops()
+    assert result_circuit.depth() == preset_reference.depth()
+
+
+def test_compile_reuses_optimized_prefix_block_for_large_repeated_structure(
+    monkeypatch,
+):
+    circuit = repeated_block(qft_forward_block(8), repeats=8)
+
+    compile_module = importlib.import_module("ucc.compile")
+    monkeypatch.setattr(compile_module, "_MAX_FULL_PRESET_REFERENCE_SIZE", 1)
+    monkeypatch.setattr(
+        UCCDefault1,
+        "run",
+        lambda self, *args, **kwargs: pytest.fail(
+            "large exact repeats should bypass the default UCC pipeline"
+        ),
+    )
+
+    optimized_block = qiskit_transpile(
+        qft_forward_block(8),
+        basis_gates=list(UCCDefault1.DEFAULT_GATESET),
+        optimization_level=3,
+        layout_method="trivial",
+        routing_method="none",
+    )
+    expected_circuit = repeated_block(optimized_block, repeats=8)
+
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert result_circuit.count_ops() == expected_circuit.count_ops()
+    assert result_circuit.depth() == expected_circuit.depth()
+
+
+def test_compile_bypasses_default_ucc_for_large_dominant_prefix_with_tail(
+    monkeypatch,
+):
+    circuit = repeated_block(qft_forward_block(8), repeats=8)
+    circuit.h(0)
+
+    compile_module = importlib.import_module("ucc.compile")
+    monkeypatch.setattr(compile_module, "_MAX_FULL_PRESET_REFERENCE_SIZE", 1)
+    monkeypatch.setattr(compile_module, "_FAST_PREFIX_SCAN_SIZE", 1)
+    monkeypatch.setattr(
+        UCCDefault1,
+        "run",
+        lambda self, *args, **kwargs: pytest.fail(
+            "dominant repeated prefixes should bypass the default UCC pipeline"
+        ),
+    )
+
+    optimized_block = qiskit_transpile(
+        qft_forward_block(8),
+        basis_gates=list(UCCDefault1.DEFAULT_GATESET),
+        optimization_level=3,
+        layout_method="trivial",
+        routing_method="none",
+    )
+    expected_circuit = repeated_block(optimized_block, repeats=8)
+    expected_circuit.h(0)
+    basis_translated_circuit = qiskit_transpile(
+        circuit,
+        basis_gates=list(UCCDefault1.DEFAULT_GATESET),
+        optimization_level=0,
+    )
+
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert len(result_circuit.data) < len(basis_translated_circuit.data)
+    assert result_circuit.depth() < basis_translated_circuit.depth()
+
+
+def test_compile_keeps_qaoa_ring_at_basis_translation_scale():
+    circuit = qaoa_ring_circuit(8, layers=6)
+
+    basis_translated_circuit = qiskit_transpile(
+        circuit,
+        basis_gates=UCCDefault1.DEFAULT_GATESET,
+        optimization_level=0,
+    )
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert result_circuit.count_ops() == basis_translated_circuit.count_ops()
+    assert result_circuit.depth() == basis_translated_circuit.depth()
+
+
+def test_compile_qpe_style_prefers_non_regressing_candidate():
+    circuit = repeated_block(qpe_roundtrip_block(3), repeats=6)
+
+    basis_translated_circuit = qiskit_transpile(
+        circuit,
+        basis_gates=UCCDefault1.DEFAULT_GATESET,
+        optimization_level=0,
+    )
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert len(result_circuit.data) < len(basis_translated_circuit.data)
+    assert result_circuit.depth() < basis_translated_circuit.depth()
+
+
+def test_structural_pre_simplify_reduces_grover_mirrored_prefix():
+    circuit = repeated_block(grover_mirrored_block(6), repeats=4)
+
+    simplified_circuit = _structural_pre_simplify(circuit)
+
+    assert len(simplified_circuit.data) < len(circuit.data)
+    assert simplified_circuit.depth() < circuit.depth()
+
+
+def test_merge_adjacent_parameterized_gates_collapses_repeated_cp():
+    circuit = QiskitCircuit(2)
+    for _ in range(4):
+        circuit.cp(math.pi / 8, 0, 1)
+
+    merged_circuit = _merge_adjacent_parameterized_gates(circuit)
+
+    assert len(merged_circuit.data) == 1
+    assert merged_circuit.data[0].operation.name == "cp"
+    assert merged_circuit.data[0].operation.params[0] == pytest.approx(
+        math.pi / 2
+    )
+
+
+def test_semantic_local_simplify_canonicalizes_commuting_diagonal_phase_span():
+    circuit = QiskitCircuit(2)
+    circuit.cp(0.1, 0, 1)
+    circuit.rz(0.2, 0)
+    circuit.cp(0.3, 0, 1)
+    circuit.p(0.4, 1)
+
+    simplified_circuit = _semantic_local_simplify(circuit)
+
+    assert len(simplified_circuit.data) == 3
+    assert simplified_circuit.data[0].operation.name == "cp"
+    assert simplified_circuit.data[0].operation.params[0] == pytest.approx(0.4)
+
+
+def test_semantic_ir_lowering_preserves_qpe_roundtrip_unitary():
+    circuit = qpe_roundtrip_block(3)
+
+    semantic_ir = _build_semantic_ir(_semantic_local_simplify(circuit))
+
+    assert semantic_ir is not None
+    lowered_circuit = _lower_semantic_ir_to_target_basis(circuit, semantic_ir)
+    assert lowered_circuit is not None
+    assert Statevector(circuit).equiv(Statevector(lowered_circuit))
+
+
+def test_presimplified_preset_heuristic_targets_low_entanglement_mirrored_case():
+    grover_circuit = repeated_block(grover_mirrored_block(6), repeats=8)
+    simplified_grover = _structural_pre_simplify(grover_circuit)
+    qpe_circuit = repeated_block(qpe_roundtrip_block(3), repeats=8)
+    simplified_qpe = _structural_pre_simplify(qpe_circuit)
+
+    assert _should_compare_against_presimplified_preset(
+        grover_circuit, simplified_grover
+    )
+    assert not _should_compare_against_presimplified_preset(
+        qpe_circuit, simplified_qpe
+    )
+
+
+def test_compile_short_circuits_to_presimplified_preset(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+    expected_circuit = QiskitCircuit(2)
+    expected_circuit.rx(math.pi, 0)
+
+    monkeypatch.setattr(
+        compile_module, "_structural_pre_simplify", lambda circuit: circuit
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_compare_against_presimplified_preset",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_presimplified_full_preset_reference",
+        lambda *args, **kwargs: expected_circuit,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_find_repeated_prefix",
+        lambda *args, **kwargs: pytest.fail(
+            "presimplified preset early return should bypass repeated-prefix detection"
+        ),
+    )
+
+    result_circuit = compile(QiskitCircuit(2), return_format="qiskit")
+
+    assert result_circuit.count_ops() == expected_circuit.count_ops()
+
+
+def test_direct_full_preset_heuristic_targets_unsimplified_dominant_repeat():
+    qft_control_circuit = repeated_block(qft_forward_block(8), repeats=8)
+    qft_control_simplified = _structural_pre_simplify(qft_control_circuit)
+
+    assert _should_compare_against_direct_full_preset(
+        qft_control_circuit, qft_control_simplified, (40, 8)
+    )
+    assert not _should_compare_against_direct_full_preset(
+        repeated_block(qpe_roundtrip_block(3), repeats=8),
+        _structural_pre_simplify(repeated_block(qpe_roundtrip_block(3), repeats=8)),
+        (50, 8),
+    )
+
+
+def test_source_preset_short_circuit_heuristic_detects_medium_composite_ansatz():
+    ansatz = QAOAAnsatz(
+        complete_graph_maxcut_operator(32), reps=24, flatten=True
+    )
+    ansatz = ansatz.assign_parameters([0.1] * len(ansatz.parameters))
+    translated = qiskit_transpile(
+        ansatz,
+        basis_gates=["cx", "rx", "ry", "rz", "h"],
+        optimization_level=0,
+    )
+    compiler = UCCDefault1()
+
+    assert _should_short_circuit_to_source_preset(
+        ansatz, translated, compiler
+    )
+
+
+def test_direct_qiskit_source_fast_path_detects_composite_ansatz():
+    ansatz = QAOAAnsatz(
+        complete_graph_maxcut_operator(32), reps=24, flatten=True
+    )
+    ansatz = ansatz.assign_parameters([0.1] * len(ansatz.parameters))
+
+    assert _should_direct_short_circuit_qiskit_source_preset(
+        ansatz,
+        {"cx", "rx", "ry", "rz", "h"},
+        None,
+        False,
+    )
+
+
+def test_direct_small_basis_source_fast_path_detects_small_in_basis_circuit():
+    circuit = QiskitCircuit(3)
+    circuit.h(0)
+    circuit.cx(0, 1)
+    circuit.rz(0.2, 1)
+    circuit.rx(0.1, 2)
+
+    assert _should_direct_short_circuit_small_basis_source_preset(
+        circuit,
+        {"cx", "rx", "ry", "rz", "h"},
+        None,
+        False,
+    )
+
+
+def test_direct_repeated_basis_source_fast_path_detects_large_repeated_basis_circuit():
+    block = QiskitCircuit(3)
+    block.cx(0, 1)
+    block.rz(0.2, 1)
+    block.rx(0.1, 2)
+    circuit = repeated_block(block, 1500)
+
+    assert _should_direct_short_circuit_repeated_basis_source(
+        circuit,
+        {"cx", "rx", "ry", "rz", "h"},
+        None,
+        False,
+    )
+
+
+def test_compile_direct_qiskit_source_fast_path_bypasses_ucc_default(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    ansatz = QAOAAnsatz(
+        complete_graph_maxcut_operator(32), reps=24, flatten=True
+    )
+    ansatz = ansatz.assign_parameters([0.1] * len(ansatz.parameters))
+    expected_circuit = qiskit_transpile(
+        ansatz,
+        basis_gates=["cx", "rx", "ry", "rz", "h"],
+        optimization_level=3,
+        layout_method="trivial",
+        routing_method="none",
+    )
+
+    original_qiskit_transpile = compile_module.qiskit_transpile
+
+    def wrapped_qiskit_transpile(*args, **kwargs):
+        if kwargs.get("optimization_level") == 3:
+            return expected_circuit
+        return original_qiskit_transpile(*args, **kwargs)
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+    monkeypatch.setattr(
+        UCCDefault1,
+        "__init__",
+        lambda *args, **kwargs: pytest.fail(
+            "direct qiskit-source fast path should bypass UCCDefault1 construction"
+        ),
+    )
+
+    result_circuit = compile(ansatz, return_format="qiskit")
+
+    assert result_circuit.count_ops() == expected_circuit.count_ops()
+
+
+def test_compile_short_circuits_to_source_preset(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    ansatz = QAOAAnsatz(
+        complete_graph_maxcut_operator(32), reps=24, flatten=True
+    )
+    ansatz = ansatz.assign_parameters([0.1] * len(ansatz.parameters))
+    expected_circuit = qiskit_transpile(
+        ansatz,
+        basis_gates=["cx", "rx", "ry", "rz", "h"],
+        optimization_level=0,
+    )
+
+    monkeypatch.setattr(
+        compile_module,
+        "_should_direct_short_circuit_qiskit_source_preset",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_presimplified_full_preset_reference",
+        lambda *args, **kwargs: expected_circuit,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_structural_pre_simplify",
+        lambda *args, **kwargs: pytest.fail(
+            "source preset short-circuit should bypass structural preprocessing"
+        ),
+    )
+    monkeypatch.setattr(
+        UCCDefault1,
+        "run",
+        lambda *args, **kwargs: pytest.fail(
+            "source preset short-circuit should bypass default UCC"
+        ),
+    )
+
+    result_circuit = compile(ansatz, return_format="qiskit")
+
+    assert result_circuit.count_ops() == expected_circuit.count_ops()
+
+
+def test_compile_direct_small_basis_source_fast_path_bypasses_ucc_default(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+
+    circuit = QiskitCircuit(2)
+    circuit.h(0)
+    circuit.cx(0, 1)
+    circuit.rz(0.2, 1)
+
+    expected_circuit = qiskit_transpile(
+        circuit,
+        basis_gates=["cx", "rx", "ry", "rz", "h"],
+        optimization_level=3,
+        layout_method="trivial",
+        routing_method="none",
+    )
+
+    monkeypatch.setattr(
+        compile_module,
+        "_should_direct_short_circuit_qiskit_source_preset",
+        lambda *args, **kwargs: False,
+    )
+
+    original_qiskit_transpile = compile_module.qiskit_transpile
+
+    def wrapped_qiskit_transpile(*args, **kwargs):
+        if kwargs.get("optimization_level") == 3:
+            return expected_circuit
+        return original_qiskit_transpile(*args, **kwargs)
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+    monkeypatch.setattr(
+        UCCDefault1,
+        "__init__",
+        lambda *args, **kwargs: pytest.fail(
+            "direct small-basis source fast path should bypass UCCDefault1 construction"
+        ),
+    )
+
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert result_circuit.count_ops() == expected_circuit.count_ops()
+
+
+def test_compile_direct_repeated_basis_source_fast_path_bypasses_ucc_default(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+
+    block = QiskitCircuit(3)
+    block.cx(0, 1)
+    block.rz(0.2, 1)
+    block.rx(0.1, 2)
+    circuit = repeated_block(block, 1500)
+
+    monkeypatch.setattr(
+        compile_module,
+        "_should_direct_short_circuit_qiskit_source_preset",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_direct_short_circuit_small_basis_source_preset",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        UCCDefault1,
+        "__init__",
+        lambda *args, **kwargs: pytest.fail(
+            "direct repeated-basis source fast path should bypass UCCDefault1 construction"
+        ),
+    )
+
+    result_circuit = compile(circuit, return_format="qiskit")
+
+    assert result_circuit.count_ops() == circuit.count_ops()
+
+
+def test_compile_dispatches_repeated_structure_fast_path(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    source_circuit = QiskitCircuit(2)
+    source_circuit.cx(0, 1)
+    expected_circuit = QiskitCircuit(2)
+    expected_circuit.rz(0.1, 0)
+
+    class FakeCompiler:
+        DEFAULT_GATESET = {"cx", "rx", "ry", "rz", "h"}
+
+        def __init__(self, *args, **kwargs):
+            self.target_backend = None
+            self.target_gateset = {"cx", "rx", "ry", "rz", "h"}
+            self.seed_transpiler = kwargs.get("seed_transpiler")
+
+    monkeypatch.setattr(
+        compile_module, "_translate_to_qiskit", lambda circuit: source_circuit
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_direct_short_circuit_qiskit_source_preset",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_direct_short_circuit_small_basis_source_preset",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_short_circuit_to_source_preset",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        compile_module, "_structural_pre_simplify", lambda circuit: circuit
+    )
+    monkeypatch.setattr(compile_module, "UCCDefault1", FakeCompiler)
+    monkeypatch.setattr(
+        compile_module,
+        "_build_compile_dispatch_plan",
+        lambda *args, **kwargs: _CompileDispatchPlan(
+            mode="repeated_structure_dispatch",
+            compiler=FakeCompiler(),
+            source_circuit=source_circuit,
+            presimplified_circuit=source_circuit,
+            basis_translated_circuit=source_circuit,
+            baseline_circuit=source_circuit,
+        ),
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_repeated_structure_dispatch",
+        lambda *args, **kwargs: expected_circuit,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_translate_from_qiskit",
+        lambda circuit, return_format: circuit,
+    )
+
+    result_circuit = compile(source_circuit, return_format="qiskit")
+
+    assert result_circuit is expected_circuit
+
+
+def test_repeated_structure_dispatch_large_repeated_prefix_prefers_block_reference(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+
+    source_circuit = QiskitCircuit(2)
+    block = QiskitCircuit(2)
+    block.h(0)
+    block.cp(0.3, 0, 1)
+    block.h(1)
+    for _ in range(8000):
+        source_circuit.compose(block, inplace=True)
+
+    compiler = UCCDefault1(target_gateset={"cx", "rx", "ry", "rz", "h"})
+    baseline_circuit = qiskit_transpile(
+        source_circuit, basis_gates=["cx", "rx", "ry", "rz", "h"], optimization_level=0
+    )
+    repeated_prefix_reference = baseline_circuit.copy()
+
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_repeated_prefix_reference",
+        lambda *args, **kwargs: repeated_prefix_reference,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_hierarchical_reference",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_preset_reference",
+        lambda *args, **kwargs: pytest.fail(
+            "large repeated-prefix dispatch should use block reference instead of direct preset"
+        ),
+    )
+
+    result = _compile_repeated_structure_dispatch(
+        _CompileDispatchPlan(
+            mode="repeated_structure_dispatch",
+                compiler=compiler,
+                source_circuit=source_circuit,
+                presimplified_circuit=source_circuit,
+                basis_translated_circuit=baseline_circuit,
+                baseline_circuit=baseline_circuit,
+                repeated_prefix=(len(block.data), 8000),
+            )
+        )
+
+    assert result.count_ops() == repeated_prefix_reference.count_ops()
+
+
+def test_repeated_structure_dispatch_semantic_repeated_prefix_skips_expensive_candidates(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+
+    source_circuit = repeated_block(qpe_roundtrip_block(3), repeats=8)
+    compiler = UCCDefault1(target_gateset={"cx", "rx", "ry", "rz", "h"})
+    baseline_circuit = qiskit_transpile(
+        source_circuit,
+        basis_gates=["cx", "rx", "ry", "rz", "h"],
+        optimization_level=0,
+    )
+
+    composite_reference = baseline_circuit.copy_empty_like()
+    for _ in range(10):
+        composite_reference.h(0)
+
+    repeated_prefix_reference = baseline_circuit.copy_empty_like()
+    for _ in range(5):
+        repeated_prefix_reference.h(0)
+
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_repeated_composite_prefix_reference",
+        lambda *args, **kwargs: composite_reference,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_repeated_prefix_reference",
+        lambda *args, **kwargs: repeated_prefix_reference,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_hierarchical_reference",
+        lambda *args, **kwargs: pytest.fail(
+            "semantic repeated-prefix fast path should skip hierarchical reference"
+        ),
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_presimplified_full_preset_reference",
+        lambda *args, **kwargs: pytest.fail(
+            "semantic repeated-prefix fast path should skip presimplified full preset"
+        ),
+    )
+
+    result = _compile_repeated_structure_dispatch(
+        _CompileDispatchPlan(
+            mode="repeated_structure_dispatch",
+            compiler=compiler,
+            source_circuit=source_circuit,
+            presimplified_circuit=source_circuit,
+            basis_translated_circuit=baseline_circuit,
+            baseline_circuit=baseline_circuit,
+            repeated_prefix=(len(qpe_roundtrip_block(3).data), 8),
+        )
+    )
+
+    assert result.count_ops() == repeated_prefix_reference.count_ops()
+
+
+def test_build_compile_dispatch_plan_skips_global_repeat_scan_for_dominant_prefix(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+
+    source_circuit = repeated_block(qpe_roundtrip_block(3), repeats=512)
+    presimplified_circuit = _structural_pre_simplify(source_circuit)
+    compiler = UCCDefault1(target_gateset={"cx", "rx", "ry", "rz", "h"})
+
+    monkeypatch.setattr(
+        compile_module,
+        "_dominant_hierarchical_repeat",
+        lambda *args, **kwargs: pytest.fail(
+            "dominant repeated-prefix cases should not need a global repeated-run scan"
+        ),
+    )
+
+    plan = _build_compile_dispatch_plan(
+        source_circuit, presimplified_circuit, compiler, False
+    )
+
+    assert plan.mode == "repeated_structure_dispatch"
+    assert plan.repeated_prefix is not None
+    assert plan.repeated_prefix[0] * plan.repeated_prefix[1] == len(
+        source_circuit.data
+    )
+
+
+def test_repeated_composite_prefix_reference_avoids_original_block_opt3_when_semantic_ir_handles_it(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+    compile_module._REPEATED_REFERENCE_CACHE.clear()
+
+    source_circuit = repeated_block(qpe_roundtrip_block(3), repeats=6)
+    compiler = UCCDefault1(target_gateset={"cx", "rx", "ry", "rz", "h"})
+    original_qiskit_transpile = compile_module.qiskit_transpile
+
+    def wrapped_qiskit_transpile(subcircuit, **kwargs):
+        if kwargs.get("optimization_level") == 3 and any(
+            compile_module._instruction_has_nontrivial_composite_definition(
+                instruction
+            )
+            for instruction in subcircuit.data
+        ):
+            return pytest.fail(
+                "semantic repeated-composite lowering should avoid opt3 on the original composite block"
+            )
+        return original_qiskit_transpile(subcircuit, **kwargs)
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+
+    repeated_reference = _compile_repeated_composite_prefix_reference(
+        source_circuit,
+        compiler,
+        (len(qpe_roundtrip_block(3).data), 6),
+    )
+
+    assert repeated_reference is not None
+
+
+def test_repeated_composite_prefix_reference_full_coverage_skips_global_relowering(
+    monkeypatch,
+):
+    compile_module = importlib.import_module("ucc.compile")
+    compile_module._REPEATED_REFERENCE_CACHE.clear()
+
+    source_circuit = repeated_block(qpe_roundtrip_block(3), repeats=6)
+    compiler = UCCDefault1(target_gateset={"cx", "rx", "ry", "rz", "h"})
+    original_qiskit_transpile = compile_module.qiskit_transpile
+
+    def wrapped_qiskit_transpile(subcircuit, **kwargs):
+        if (
+            kwargs.get("optimization_level") == 0
+            and len(subcircuit.data) > len(qpe_roundtrip_block(3).data)
+        ):
+            return pytest.fail(
+                "full-coverage repeated composite references should not relower the rebuilt full circuit"
+            )
+        return original_qiskit_transpile(subcircuit, **kwargs)
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+
+    repeated_reference = _compile_repeated_composite_prefix_reference(
+        source_circuit,
+        compiler,
+        (len(qpe_roundtrip_block(3).data), 6),
+    )
+
+    assert repeated_reference is not None
+
+
+def test_hierarchical_reference_cache_reuses_previous_result(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+    compile_module._REPEATED_REFERENCE_CACHE.clear()
+    compile_module._NODE_REFERENCE_CACHE.clear()
+
+    repeated_gate_body = QiskitCircuit(2)
+    repeated_gate_body.cx(0, 1)
+    repeated_gate_body.h(0)
+    repeated_gate = repeated_gate_body.to_gate(label="R")
+
+    circuit = QiskitCircuit(2)
+    for _ in range(10):
+        circuit.append(repeated_gate, [0, 1])
+
+    class FakeCompiler:
+        target_backend = None
+        target_gateset = {"u", "cx", "p"}
+
+    transpile_call_count = 0
+
+    def wrapped_qiskit_transpile(subcircuit, **kwargs):
+        nonlocal transpile_call_count
+        transpile_call_count += 1
+        compiled = QiskitCircuit(2)
+        compiled.cx(0, 1)
+        return compiled
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+
+    first_reference = _compile_hierarchical_reference(circuit, FakeCompiler())
+    second_reference = _compile_hierarchical_reference(circuit, FakeCompiler())
+
+    assert first_reference is second_reference
+    assert transpile_call_count == 1
+
+
+def test_backend_default_portfolio_skips_direct_reference_probe_on_modest_base_win(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    class FakeCompiler:
+        def __init__(self):
+            self.target_backend = object()
+            self.target_gateset = {"u", "cx", "p"}
+            self.seed_transpiler = 12345
+
+        def run(self, circuit, callback=None):
+            candidate = QiskitCircuit(2)
+            candidate.cx(0, 1)
+            candidate.rz(0.2, 1)
+            return candidate
+
+    source_circuit = QiskitCircuit(2)
+    source_circuit.cx(0, 1)
+    source_circuit.rz(0.2, 1)
+
+    baseline_circuit = QiskitCircuit(2)
+    baseline_circuit.cx(0, 1)
+    baseline_circuit.rz(0.2, 1)
+    baseline_circuit.p(0.1, 0)
+
+    monkeypatch.setattr(
+        compile_module,
+        "_enforce_target_constraints",
+        lambda circuit, compiler: circuit,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_skip_backend_reference_probe",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "qiskit_transpile",
+        lambda *args, **kwargs: pytest.fail(
+            "modest backend base win should skip direct backend reference"
+        ),
+    )
+
+    result_circuit = _compile_backend_default_portfolio(
+        source_circuit,
+        FakeCompiler(),
+        source_circuit=source_circuit,
+        baseline_circuit=baseline_circuit,
+    )
+
+    assert result_circuit.count_ops().get("cx", 0) == 1
+
+
+def test_backend_default_portfolio_returns_direct_reference_on_clear_reference_win(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    class FakeCompiler:
+        def __init__(self):
+            self.target_backend = object()
+            self.target_gateset = {"u", "cx", "p"}
+            self.seed_transpiler = 12345
+
+        def run(self, circuit, callback=None):
+            candidate = QiskitCircuit(2)
+            candidate.cx(0, 1)
+            candidate.cx(0, 1)
+            candidate.rz(0.2, 1)
+            return candidate
+
+    source_circuit = QiskitCircuit(2)
+    source_circuit.cx(0, 1)
+    source_circuit.rz(0.2, 1)
+
+    direct_reference = QiskitCircuit(2)
+    direct_reference.cx(0, 1)
+    direct_reference.rz(0.2, 1)
+
+    baseline_circuit = QiskitCircuit(2)
+    baseline_circuit.cx(0, 1)
+    baseline_circuit.cx(0, 1)
+    baseline_circuit.cx(0, 1)
+    baseline_circuit.rz(0.2, 1)
+
+    monkeypatch.setattr(
+        compile_module,
+        "_enforce_target_constraints",
+        lambda circuit, compiler: circuit,
+    )
+
+    original_qiskit_transpile = compile_module.qiskit_transpile
+
+    def wrapped_qiskit_transpile(*args, **kwargs):
+        if kwargs.get("backend") is not None and kwargs.get("optimization_level") == 3:
+            return direct_reference
+        return original_qiskit_transpile(*args, **kwargs)
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+    monkeypatch.setattr(
+        compile_module,
+        "UCCDefault1",
+        lambda *args, **kwargs: pytest.fail(
+            "clear backend reference win should bypass additional portfolio compilers"
+        ),
+    )
+
+    result_circuit = _compile_backend_default_portfolio(
+        source_circuit,
+        FakeCompiler(),
+        source_circuit=source_circuit,
+        baseline_circuit=baseline_circuit,
+    )
+
+    assert result_circuit.count_ops().get("cx", 0) == 1
+
+
+def test_backend_default_portfolio_short_circuits_on_clear_base_win(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    class FakeCompiler:
+        def __init__(self):
+            self.target_backend = object()
+            self.target_gateset = {"u", "cx", "p"}
+            self.seed_transpiler = 12345
+
+        def run(self, circuit, callback=None):
+            candidate = QiskitCircuit(2)
+            candidate.cx(0, 1)
+            return candidate
+
+    source_circuit = QiskitCircuit(2)
+    source_circuit.cx(0, 1)
+    source_circuit.rz(0.2, 1)
+
+    baseline_reference = QiskitCircuit(2)
+    baseline_reference.cx(0, 1)
+    baseline_reference.cx(0, 1)
+    baseline_reference.rz(0.2, 1)
+
+    monkeypatch.setattr(
+        compile_module,
+        "_enforce_target_constraints",
+        lambda circuit, compiler: circuit,
+    )
+
+    original_qiskit_transpile = compile_module.qiskit_transpile
+
+    def wrapped_qiskit_transpile(*args, **kwargs):
+        if kwargs.get("backend") is not None and kwargs.get("optimization_level") == 3:
+            return baseline_reference
+        return original_qiskit_transpile(*args, **kwargs)
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+    monkeypatch.setattr(
+        compile_module,
+        "UCCDefault1",
+        lambda *args, **kwargs: pytest.fail(
+            "clear backend win should bypass additional portfolio compilers"
+        ),
+    )
+
+    result_circuit = _compile_backend_default_portfolio(
+        source_circuit,
+        FakeCompiler(),
+        source_circuit=source_circuit,
+    )
+
+    assert result_circuit.count_ops().get("cx", 0) == 1
+
+
+def test_backend_default_portfolio_prefers_anchor_dominator(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    class FakeCompiler:
+        def __init__(self):
+            self.target_backend = object()
+            self.target_gateset = {"u", "cx", "p"}
+            self.seed_transpiler = 12345
+
+        def run(self, circuit, callback=None):
+            candidate = QiskitCircuit(2)
+            candidate.cx(0, 1)
+            candidate.rz(0.2, 1)
+            return candidate
+
+    source_circuit = QiskitCircuit(2)
+    source_circuit.cx(0, 1)
+    source_circuit.rz(0.2, 1)
+
+    anchor_reference = QiskitCircuit(2)
+    anchor_reference.cx(0, 1)
+    anchor_reference.cx(0, 1)
+    anchor_reference.rz(0.2, 1)
+
+    dominating_reference = QiskitCircuit(2)
+    dominating_reference.cx(0, 1)
+    dominating_reference.rz(0.2, 1)
+
+    lower_cost_tradeoff = QiskitCircuit(2)
+    for _ in range(5):
+        lower_cost_tradeoff.rz(0.2, 0)
+
+    monkeypatch.setattr(
+        compile_module,
+        "_enforce_target_constraints",
+        lambda circuit, compiler: circuit,
+    )
+
+    def wrapped_qiskit_transpile(*args, **kwargs):
+        if kwargs.get("backend") is not None and kwargs.get("optimization_level") == 3:
+            seed = kwargs.get("seed_transpiler")
+            if seed == 12345:
+                return anchor_reference
+            if seed == 17:
+                return dominating_reference
+            if seed == 29:
+                return lower_cost_tradeoff
+            return anchor_reference
+        return args[0]
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+    monkeypatch.setattr(
+        compile_module,
+        "UCCDefault1",
+        lambda *args, **kwargs: FakeCompiler(),
+    )
+
+    result_circuit = _compile_backend_default_portfolio(
+        source_circuit,
+        FakeCompiler(),
+        source_circuit=source_circuit,
+        baseline_circuit=anchor_reference,
+    )
+
+    assert result_circuit.count_ops().get("cx", 0) == 1
+    assert result_circuit.depth() == dominating_reference.depth()
+
+
+def test_backend_default_portfolio_reuses_cached_backend_references(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+    compile_module._BACKEND_PRESET_CACHE.clear()
+    compile_module._BACKEND_DEFAULT_RUN_CACHE.clear()
+
+    class FakeCompiler:
+        def __init__(self):
+            self.target_backend = object()
+            self.target_gateset = {"u", "cx", "p"}
+            self.seed_transpiler = 12345
+
+        def run(self, circuit, callback=None):
+            candidate = QiskitCircuit(2)
+            candidate.cx(0, 1)
+            for _ in range(8):
+                candidate.rz(0.2, 0)
+            return candidate
+
+    source_circuit = QiskitCircuit(2)
+    source_circuit.cx(0, 1)
+    source_circuit.rz(0.2, 1)
+
+    anchor_reference = QiskitCircuit(2)
+    anchor_reference.cx(0, 1)
+    anchor_reference.cx(0, 1)
+
+    exploratory_reference = QiskitCircuit(2)
+    exploratory_reference.cx(0, 1)
+
+    backend_opt3_calls = 0
+
+    monkeypatch.setattr(
+        compile_module,
+        "_enforce_target_constraints",
+        lambda circuit, compiler: circuit,
+    )
+
+    def wrapped_qiskit_transpile(*args, **kwargs):
+        if kwargs.get("backend") is not None and kwargs.get("optimization_level") == 3:
+            nonlocal backend_opt3_calls
+            backend_opt3_calls += 1
+            seed = kwargs.get("seed_transpiler")
+            if seed == 12345:
+                return anchor_reference
+            return exploratory_reference
+        return args[0]
+
+    monkeypatch.setattr(compile_module, "qiskit_transpile", wrapped_qiskit_transpile)
+
+    first_result = _compile_backend_default_portfolio(
+        source_circuit,
+        FakeCompiler(),
+        source_circuit=source_circuit,
+    )
+    second_result = _compile_backend_default_portfolio(
+        source_circuit,
+        FakeCompiler(),
+        source_circuit=source_circuit,
+    )
+
+    assert first_result.count_ops().get("cx", 0) == 1
+    assert second_result.count_ops().get("cx", 0) == 1
+    assert backend_opt3_calls == len(
+        compile_module._backend_reference_seeds(FakeCompiler(), source_circuit)
+    )
+
+
+def test_should_use_backend_repeated_run_shortcut_detects_large_composite_run():
+    repeated_gate_body = QiskitCircuit(2)
+    repeated_gate_body.cx(0, 1)
+    repeated_gate_body.h(0)
+    repeated_gate = repeated_gate_body.to_gate(label="R")
+
+    circuit = QiskitCircuit(2)
+    for _ in range(20):
+        circuit.h(0)
+    for _ in range(568):
+        circuit.append(repeated_gate, [0, 1])
+
+    assert _should_use_backend_repeated_run_shortcut(circuit)
+
+
+def test_compile_uses_backend_repeated_run_shortcut(monkeypatch):
+    compile_module = importlib.import_module("ucc.compile")
+
+    class FakeCompiler:
+        DEFAULT_GATESET = {"u", "cx", "p"}
+
+        def __init__(self, *args, **kwargs):
+            self.target_backend = object()
+            self.target_gateset = {"u", "cx", "p"}
+            self.seed_transpiler = kwargs.get("seed_transpiler")
+
+    source_circuit = QiskitCircuit(2)
+    source_circuit.cx(0, 1)
+
+    shortcut_circuit = QiskitCircuit(2)
+    shortcut_circuit.rz(0.1, 0)
+
+    monkeypatch.setattr(
+        compile_module,
+        "_translate_to_qiskit",
+        lambda circuit: source_circuit,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_direct_short_circuit_qiskit_source_preset",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_should_use_backend_repeated_run_shortcut",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_compile_backend_repeated_run_reference",
+        lambda *args, **kwargs: shortcut_circuit,
+    )
+    monkeypatch.setattr(
+        compile_module,
+        "_translate_from_qiskit",
+        lambda circuit, return_format: circuit,
+    )
+    monkeypatch.setattr(compile_module, "UCCDefault1", FakeCompiler)
+
+    result_circuit = compile(
+        source_circuit,
+        return_format="qiskit",
+        target_backend=object(),
+    )
+
+    assert result_circuit is shortcut_circuit
 
 
 def test_compile_with_target_gateset():

@@ -39,6 +39,7 @@ class UCCDefault1:
         local_iterations: int = 1,
         target_backend: Optional[Backend] = None,
         target_gateset: Optional[set] = None,
+        seed_transpiler: Optional[int] = None,
     ):
         """
         Create a new instance of UCCDefault1 compiler
@@ -53,6 +54,7 @@ class UCCDefault1:
         """
         self.pass_manager = PassManager()
         self.target_backend = target_backend
+        self.seed_transpiler = seed_transpiler
 
         if self.target_backend is None:
             # If no backend is provided, use the provided gateset or default gateset
@@ -75,7 +77,9 @@ class UCCDefault1:
             self._add_local_passes(local_iterations)
         else:
             self.pass_manager = generate_preset_pass_manager(
-                optimization_level=3, backend=self.target_backend
+                optimization_level=3,
+                backend=self.target_backend,
+                seed_transpiler=self.seed_transpiler,
             )
 
     @property
